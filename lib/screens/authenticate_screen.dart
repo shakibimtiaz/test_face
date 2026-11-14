@@ -37,6 +37,9 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
 
   CameraController? _controller;
   CameraDescription? _camera;
+  List<CameraDescription> _cameras = [];
+  CameraLensDirection _lens = CameraLensDirection.front; // front or back
+  bool _switching = false;
   bool _cameraStarting = false;
   bool _pausedByLifecycle = false;
   int _cameraGeneration = 0; // bumped on every start/stop to cancel stale starts
@@ -115,12 +118,14 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     final generation = ++_cameraGeneration;
     CameraController? controller;
     try {
-      final cameras = await availableCameras();
+      if (_cameras.isEmpty) _cameras = await availableCameras();
+      final cameras = _cameras;
       if (cameras.isEmpty) throw CameraException('noCamera', 'No camera found');
       _camera = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
+        (c) => c.lensDirection == _lens,
         orElse: () => cameras.first,
       );
+      _lens = _camera!.lensDirection;
       controller = CameraController(
         _camera!,
         ResolutionPreset.medium,
@@ -291,6 +296,27 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     }
   }
 
+  bool get _hasBothCameras =>
+      _cameras.any((c) => c.lensDirection == CameraLensDirection.front) &&
+      _cameras.any((c) => c.lensDirection == CameraLensDirection.back);
+
+  /// Switches between the front and back camera. The rotation of each camera
+  /// is handled by its own sensorOrientation, so recognition + blink detection
+  /// work the same on both. The session restarts because tracking IDs differ.
+  Future<void> _switchCamera() async {
+    if (_switching || _stage == _Stage.success) return;
+    _switching = true;
+    try {
+      await _stopCamera();
+      _lens = _lens == CameraLensDirection.front
+          ? CameraLensDirection.back
+          : CameraLensDirection.front;
+      await _startCamera();
+    } finally {
+      _switching = false;
+    }
+  }
+
   Future<void> _onAuthenticated() async {
     final m = _match!;
     setState(() {
@@ -306,7 +332,21 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(title: const Text('Authenticate')),
+      appBar: AppBar(
+        title: const Text('Authenticate'),
+        actions: [
+          if (_hasBothCameras && _stage != _Stage.success && _error == null)
+            IconButton(
+              tooltip: _lens == CameraLensDirection.front
+                  ? 'Switch to back camera'
+                  : 'Switch to front camera',
+              icon: Icon(_lens == CameraLensDirection.front
+                  ? Icons.camera_rear
+                  : Icons.camera_front),
+              onPressed: _switching ? null : _switchCamera,
+            ),
+        ],
+      ),
       body: _error != null
           ? _buildError()
           : _stage == _Stage.success
