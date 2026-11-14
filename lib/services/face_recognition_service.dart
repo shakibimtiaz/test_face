@@ -30,6 +30,9 @@ class FaceRecognitionService {
 
   bool get isLoaded => _interpreter != null;
 
+  /// Width/height the model expects (112 for MobileFaceNet).
+  int get inputSize => _inputShape[1];
+
   Future<void> load() async {
     if (_interpreter != null) return;
     final options = InterpreterOptions()..threads = 2;
@@ -52,12 +55,15 @@ class FaceRecognitionService {
     final batch = _inputShape[0];
     final h = _inputShape[1];
     final w = _inputShape[2];
-    final resized = img.copyResize(
-      face,
-      width: w,
-      height: h,
-      interpolation: img.Interpolation.linear,
-    );
+    // Real-time crops are already sampled at the model size — skip resizing.
+    final resized = (face.width == w && face.height == h)
+        ? face
+        : img.copyResize(
+            face,
+            width: w,
+            height: h,
+            interpolation: img.Interpolation.linear,
+          );
 
     // Normalise pixels to [-1, 1] as MobileFaceNet expects.
     final perImage = w * h * 3;

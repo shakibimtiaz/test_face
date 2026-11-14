@@ -1,9 +1,7 @@
 import 'dart:async';
 import 'dart:io';
-// [LIVENESS] import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
@@ -11,20 +9,16 @@ import '../services/database_service.dart';
 import '../services/face_recognition_service.dart';
 import '../utils/image_utils.dart';
 
-// ---------------------------------------------------------------------------
-// LIVENESS IS CURRENTLY DISABLED.
-// Every liveness-related line is commented out and marked with `[LIVENESS]`.
-// To re-enable it: uncomment the `[LIVENESS]` lines/blocks and remove the
-// `[AUTH-ONLY]` lines that replaced them.
-// ---------------------------------------------------------------------------
-
-// [LIVENESS] Liveness challenges. A printed photo or a photo on a screen cannot
-// blink, smile on demand, or turn its head in 3D while ML Kit keeps tracking
-// the same face, so passing these proves a live person is in front of the camera.
-// enum Challenge { blink, smile, turnHead }
-
-// [LIVENESS] enum _Stage { loading, identify, liveness, finalCheck, success, failed }
-enum _Stage { loading, identify, success, failed } // [AUTH-ONLY]
+/// Real-time authentication.
+///
+/// On EVERY camera frame, in parallel:
+///   • Face recognition — the face is matched against the registered faces.
+///   • Liveness — eye blinking is tracked (open → closed → open).
+///
+/// Both must happen on the same tracked face (ML Kit trackingId). As soon as
+/// the face matches AND one blink has been seen, the user is authenticated.
+/// A printed photo / photo on a screen can't blink, so it never passes.
+enum _Stage { loading, scanning, success, failed }
 
 class AuthenticateScreen extends StatefulWidget {
   const AuthenticateScreen({super.key});
@@ -35,7 +29,11 @@ class AuthenticateScreen extends StatefulWidget {
 
 class _AuthenticateScreenState extends State<AuthenticateScreen>
     with WidgetsBindingObserver {
-  // [LIVENESS] static const _sessionTimeout = Duration(seconds: 20);
+  // Blink thresholds on ML Kit's eye-open probability (0 = closed, 1 = open).
+  static const _eyeOpen = 0.6;
+  static const _eyeClosed = 0.3;
+  // Frames without a face before the current session is reset.
+  static const _maxMissedFrames = 8;
 
   CameraController? _controller;
   CameraDescription? _camera;
@@ -46,9 +44,8 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   final _detector = FaceDetector(
     options: FaceDetectorOptions(
       performanceMode: FaceDetectorMode.fast,
-      // [LIVENESS] enableClassification: true, // eye-open & smiling probabilities
-      enableLandmarks: true,
-      // [LIVENESS] enableTracking: true, // same trackingId across frames
+      enableClassification: true, // eye-open probabilities (blink)
+      enableTracking: true, // same trackingId across frames
       minFaceSize: 0.25,
     ),
   );
@@ -59,20 +56,14 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   String _message = 'Starting camera…';
   String? _error;
 
-  // Identity / session state
-  FaceMatch? _candidate;
-  // [LIVENESS] int? _trackingId;
-  // [LIVENESS] DateTime? _sessionStart;
-  // [LIVENESS] int _missedFrames = 0;
+  // Per-face session state (reset when the tracked face changes / is lost).
+  int? _trackingId;
+  int _missedFrames = 0;
+  FaceMatch? _match; // set once the face is recognised
   double? _lastScore;
-
-  // [LIVENESS] Liveness state
-  // List<Challenge> _challenges = [];
-  // int _challengeIndex = 0;
-  // bool _eyesWereOpen = false;
-  // bool _eyesWereClosed = false;
-  // bool _wasNeutral = false;
-  // bool _headTurned = false;
+  bool _eyesWereOpen = false;
+  bool _eyesClosed = false;
+  bool _blinkDetected = false;
 
   @override
   void initState() {
@@ -151,7 +142,7 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
 
       await controller.startImageStream(_onFrame);
       _controller = controller;
-      _resetSession(message: 'Look straight at the camera');
+      _resetSession(message: 'Look at the camera and blink');
     } on CameraException catch (e) {
       await controller?.dispose();
       if (!mounted || generation != _cameraGeneration) return;
@@ -179,51 +170,31 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     await c.dispose();
   }
 
+  /// Clears recognition + blink state (new person / face lost).
   void _resetSession({String? message}) {
     if (!mounted) return;
     setState(() {
-      _stage = _Stage.identify;
-      _candidate = null;
-      // [LIVENESS] _trackingId = null;
-      // [LIVENESS] _sessionStart = null;
-      // [LIVENESS] _missedFrames = 0;
-      // [LIVENESS] _challengeIndex = 0;
-      // [LIVENESS] _challenges = [];
-      _message = message ?? 'Look straight at the camera';
+      _stage = _Stage.scanning;
+      _trackingId = null;
+      _missedFrames = 0;
+      _match = null;
+      _eyesWereOpen = false;
+      _eyesClosed = false;
+      _blinkDetected = false;
+      if (message != null) _message = message;
     });
   }
-
-  /* [LIVENESS] only used by the liveness flow
-  void _fail(String reason) {
-    setState(() {
-      _stage = _Stage.failed;
-      _message = reason;
-    });
-    // Automatically try again after a short pause.
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted && _stage == _Stage.failed && _error == null) {
-        _resetSession();
-      }
-    });
-  }
-  */
 
   Future<void> _onFrame(CameraImage image) async {
-    if (_busy || _camera == null) return;
-    // [LIVENESS] if (_stage != _Stage.identify &&
-    // [LIVENESS]     _stage != _Stage.liveness &&
-    // [LIVENESS]     _stage != _Stage.finalCheck) {
-    // [LIVENESS]   return;
-    // [LIVENESS] }
-    if (_stage != _Stage.identify) return; // [AUTH-ONLY]
+    if (_busy || _camera == null || _stage != _Stage.scanning) return;
     _busy = true;
     try {
       final frame = ImageUtils.frameFromCameraImage(image, _camera!);
       if (frame == null) return;
       final faces =
           await _detector.processImage(ImageUtils.inputImageFromFrame(frame));
-      if (!mounted) return;
-      await _handleFaces(faces, frame);
+      if (!mounted || _stage != _Stage.scanning) return;
+      await _process(faces, frame);
     } catch (e) {
       debugPrint('Frame error: $e');
     } finally {
@@ -231,195 +202,105 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     }
   }
 
-  bool _isFrontal(Face f) =>
-      (f.headEulerAngleY ?? 0).abs() < 12 &&
-      (f.headEulerAngleZ ?? 0).abs() < 12 &&
-      (f.headEulerAngleX ?? 0).abs() < 15;
-
-  Future<FaceMatch?> _match(Face face, FrameData frame) async {
-    final crop =
-        await compute(cropFaceFromFrame, CropRequest(frame, face.boundingBox));
-    final emb = FaceRecognitionService.instance.getEmbedding(crop);
-    return FaceRecognitionService.findBestMatch(emb, _registered);
-  }
-
-  Future<void> _handleFaces(List<Face> faces, FrameData frame) async {
-    /* [LIVENESS] Session timeout
-    if (_sessionStart != null &&
-        DateTime.now().difference(_sessionStart!) > _sessionTimeout) {
-      _fail('Timed out. Liveness check not completed.');
-      return;
-    }
-    */
-
+  Future<void> _process(List<Face> faces, FrameData frame) async {
+    // ---- Face presence -----------------------------------------------------
     if (faces.isEmpty) {
-      setState(() => _message = 'No face detected'); // [AUTH-ONLY]
-      /* [LIVENESS]
-      if (_stage == _Stage.identify) {
+      if (++_missedFrames > _maxMissedFrames && _trackingId != null) {
+        _resetSession(message: 'No face detected');
+      } else if (_trackingId == null) {
         setState(() => _message = 'No face detected');
-      } else if (++_missedFrames > 15) {
-        _fail('Face lost. Keep your face inside the frame.');
       }
-      */
       return;
     }
     if (faces.length > 1) {
-      setState(() => _message = 'Only one face allowed'); // [AUTH-ONLY]
-      /* [LIVENESS]
-      if (_stage == _Stage.identify) {
-        setState(() => _message = 'Only one face allowed');
-      } else {
-        _fail('Multiple faces detected.');
-      }
-      */
+      _resetSession(message: 'Only one face allowed');
       return;
     }
-    // [LIVENESS] _missedFrames = 0;
+    _missedFrames = 0;
     final face = faces.first;
 
-    /* [LIVENESS] Once identified, the very same tracked face must complete every step.
-    if (_stage != _Stage.identify &&
-        _trackingId != null &&
+    // A different face appeared → start over for the new face.
+    if (_trackingId != null &&
         face.trackingId != null &&
         face.trackingId != _trackingId) {
-      _fail('A different face appeared. Starting over.');
-      return;
+      _resetSession(message: 'Look at the camera and blink');
     }
-    */
+    _trackingId ??= face.trackingId;
 
-    await _identify(face, frame); // [AUTH-ONLY]
-    /* [LIVENESS]
-    switch (_stage) {
-      case _Stage.identify:
-        await _identify(face, frame);
-      case _Stage.liveness:
-        _checkLiveness(face);
-      case _Stage.finalCheck:
-        await _finalCheck(face, frame);
-      default:
-        break;
-    }
-    */
-  }
+    // ---- 1) Liveness: blink detection (every frame) ------------------------
+    _updateBlink(face);
 
-  Future<void> _identify(Face face, FrameData frame) async {
-    if (!_isFrontal(face)) {
-      setState(() => _message = 'Look straight at the camera');
-      return;
-    }
-    final best = await _match(face, frame);
-    if (!mounted || best == null) return;
-    _lastScore = best.similarity;
-    if (best.similarity < FaceRecognitionService.matchThreshold) {
-      setState(() => _message =
-          'Face not recognized (score ${best.similarity.toStringAsFixed(2)})');
+    // ---- 2) Recognition (every frame until matched) ------------------------
+    if (_match == null) _recognize(face, frame);
+
+    // ---- Both done? --------------------------------------------------------
+    if (_match != null && _blinkDetected) {
+      await _onAuthenticated();
       return;
     }
 
-    // [AUTH-ONLY] Face matched → authenticated immediately (no liveness).
     setState(() {
-      _stage = _Stage.success;
-      _candidate = best;
-      _message = 'Authenticated successfully';
-    });
-    await DatabaseService.instance
-        .insertAttendance(best.face.id!, best.face.name, best.similarity);
-    _stopCamera();
-
-    /* [LIVENESS] Identity candidate found — now prove liveness. Blink is always
-    // required; one more random challenge makes pre-recorded videos less useful.
-    final rnd = math.Random();
-    final extra = [Challenge.smile, Challenge.turnHead][rnd.nextInt(2)];
-    final challenges = rnd.nextBool()
-        ? [Challenge.blink, extra]
-        : [extra, Challenge.blink];
-    setState(() {
-      _candidate = best;
-      _trackingId = face.trackingId;
-      _sessionStart = DateTime.now();
-      _challenges = challenges;
-      _challengeIndex = 0;
-      _stage = _Stage.liveness;
-      _resetChallengeFlags();
-      _message = _challengeText(challenges.first);
-    });
-    */
-  }
-
-  /* [LIVENESS] ---------- liveness helpers (disabled) ----------
-  void _resetChallengeFlags() {
-    _eyesWereOpen = false;
-    _eyesWereClosed = false;
-    _wasNeutral = false;
-    _headTurned = false;
-  }
-
-  String _challengeText(Challenge c) => switch (c) {
-        Challenge.blink => 'Blink your eyes',
-        Challenge.smile => 'Smile',
-        Challenge.turnHead => 'Turn your head to one side, then back',
-      };
-
-  void _checkLiveness(Face face) {
-    final challenge = _challenges[_challengeIndex];
-    var done = false;
-
-    switch (challenge) {
-      case Challenge.blink:
-        final l = face.leftEyeOpenProbability;
-        final r = face.rightEyeOpenProbability;
-        if (l == null || r == null) break;
-        if (l > 0.7 && r > 0.7) {
-          if (_eyesWereClosed) done = true; // open → closed → open
-          _eyesWereOpen = true;
-        } else if (l < 0.25 && r < 0.25 && _eyesWereOpen) {
-          _eyesWereClosed = true;
-        }
-      case Challenge.smile:
-        final s = face.smilingProbability;
-        if (s == null) break;
-        if (s < 0.3) _wasNeutral = true; // must go neutral → smiling
-        if (s > 0.8 && _wasNeutral) done = true;
-      case Challenge.turnHead:
-        final yaw = (face.headEulerAngleY ?? 0).abs();
-        if (yaw > 25) _headTurned = true;
-        if (_headTurned && yaw < 10) done = true; // turned → back to centre
-    }
-
-    if (!done) return;
-    _challengeIndex++;
-    _resetChallengeFlags();
-    setState(() {
-      if (_challengeIndex >= _challenges.length) {
-        _stage = _Stage.finalCheck;
-        _message = 'Look straight at the camera';
+      if (_match == null) {
+        _message = _lastScore == null
+            ? 'Look straight at the camera'
+            : 'Face not recognized';
       } else {
-        _message = _challengeText(_challenges[_challengeIndex]);
+        _message = 'Blink your eyes';
       }
     });
   }
 
-  Future<void> _finalCheck(Face face, FrameData frame) async {
-    if (!_isFrontal(face)) return;
-    // Re-verify identity after liveness so no one can swap faces mid-way.
-    final best = await _match(face, frame);
-    if (!mounted || best == null) return;
-    _lastScore = best.similarity;
-    if (best.similarity >= FaceRecognitionService.matchThreshold &&
-        best.face.id == _candidate!.face.id) {
-      setState(() {
-        _stage = _Stage.success;
-        _candidate = best;
-        _message = 'Authenticated';
-      });
-      await DatabaseService.instance
-          .insertAttendance(best.face.id!, best.face.name, best.similarity);
-      _stopCamera();
-    } else {
-      _fail('Face did not match after liveness check.');
+  void _updateBlink(Face face) {
+    if (_blinkDetected) return;
+    final l = face.leftEyeOpenProbability;
+    final r = face.rightEyeOpenProbability;
+    if (l == null || r == null) return;
+
+    final open = l > _eyeOpen && r > _eyeOpen;
+    // Counts as closed when either eye closes, so a single blink — even of
+    // one eye — is enough.
+    final closed = l < _eyeClosed || r < _eyeClosed;
+
+    if (open) {
+      if (_eyesClosed && _eyesWereOpen) {
+        _blinkDetected = true; // open → closed → open
+      }
+      _eyesWereOpen = true;
+      _eyesClosed = false;
+    } else if (closed && _eyesWereOpen) {
+      _eyesClosed = true;
     }
   }
-  ---------- end of liveness helpers ---------- */
+
+  void _recognize(Face face, FrameData frame) {
+    // Skip frames that would give a poor embedding.
+    final yaw = (face.headEulerAngleY ?? 0).abs();
+    final roll = (face.headEulerAngleZ ?? 0).abs();
+    final l = face.leftEyeOpenProbability ?? 1;
+    final r = face.rightEyeOpenProbability ?? 1;
+    if (yaw > 20 || roll > 20 || l < 0.4 || r < 0.4) return;
+
+    final service = FaceRecognitionService.instance;
+    final crop = cropFaceFromFrameFast(frame, face.boundingBox, service.inputSize);
+    final emb = service.getEmbedding(crop);
+    final best = FaceRecognitionService.findBestMatch(emb, _registered);
+    if (best == null) return;
+    _lastScore = best.similarity;
+    if (best.similarity >= FaceRecognitionService.matchThreshold) {
+      _match = best;
+    }
+  }
+
+  Future<void> _onAuthenticated() async {
+    final m = _match!;
+    setState(() {
+      _stage = _Stage.success;
+      _message = 'Authenticated successfully';
+    });
+    _stopCamera();
+    await DatabaseService.instance
+        .insertAttendance(m.face.id!, m.face.name, m.similarity);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -446,7 +327,7 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
       );
 
   Widget _buildSuccess() {
-    final m = _candidate!;
+    final m = _match!;
     return Container(
       color: Colors.green.shade700,
       width: double.infinity,
@@ -461,7 +342,7 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 36,
+                fontSize: 32,
                 fontWeight: FontWeight.bold,
               ),
             ),
@@ -476,8 +357,7 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
               style: const TextStyle(color: Colors.white, fontSize: 24),
             ),
             Text(
-              // [LIVENESS] 'Match score ${m.similarity.toStringAsFixed(2)} • Live face verified',
-              'Match score ${m.similarity.toStringAsFixed(2)}', // [AUTH-ONLY]
+              'Match score ${m.similarity.toStringAsFixed(2)} • Liveness detected (blink)',
               style: const TextStyle(color: Colors.white70),
             ),
             const SizedBox(height: 32),
@@ -491,18 +371,27 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     );
   }
 
+  Widget _statusChip(String label, bool ok) => Chip(
+        avatar: Icon(
+          ok ? Icons.check_circle : Icons.hourglass_empty,
+          color: ok ? Colors.green : Colors.orange,
+          size: 18,
+        ),
+        label: Text(label),
+        visualDensity: VisualDensity.compact,
+      );
+
   Widget _buildCamera() {
     final c = _controller;
     if (c == null || !c.value.isInitialized) {
       return const Center(child: CircularProgressIndicator());
     }
-    final failed = _stage == _Stage.failed;
-    // [LIVENESS] final color = failed
-    // [LIVENESS]     ? Colors.redAccent
-    // [LIVENESS]     : _stage == _Stage.identify
-    // [LIVENESS]         ? Colors.white
-    // [LIVENESS]         : Colors.lightGreenAccent;
-    final color = failed ? Colors.redAccent : Colors.white; // [AUTH-ONLY]
+    final recognized = _match != null;
+    final color = recognized && _blinkDetected
+        ? Colors.lightGreenAccent
+        : recognized || _blinkDetected
+            ? Colors.amberAccent
+            : Colors.white;
 
     return Stack(
       fit: StackFit.expand,
@@ -537,11 +426,6 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // [LIVENESS] if (_candidate != null && _stage != _Stage.failed)
-                // [LIVENESS]   Text(
-                // [LIVENESS]     'Hello ${_candidate!.face.name} — liveness check',
-                // [LIVENESS]     style: const TextStyle(color: Colors.white70),
-                // [LIVENESS]   ),
                 Text(
                   _message,
                   textAlign: TextAlign.center,
@@ -551,26 +435,18 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                /* [LIVENESS] challenge progress dots
-                if (_challenges.isNotEmpty && _stage == _Stage.liveness) ...[
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: List.generate(
-                      _challenges.length,
-                      (i) => Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4),
-                        child: Icon(
-                          i < _challengeIndex
-                              ? Icons.check_circle
-                              : Icons.radio_button_unchecked,
-                          color: Colors.lightGreenAccent,
-                        ),
-                      ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    _statusChip(
+                      recognized ? 'Face: ${_match!.face.name}' : 'Face',
+                      recognized,
                     ),
-                  ),
-                ],
-                */
+                    _statusChip('Liveness (blink)', _blinkDetected),
+                  ],
+                ),
                 if (_lastScore != null)
                   Text(
                     'score ${_lastScore!.toStringAsFixed(2)} / '
