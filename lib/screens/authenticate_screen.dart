@@ -442,17 +442,22 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
             child: CameraPreview(c),
           ),
         ),
-        // Face guide
-        Center(
-          child: Container(
-            width: 240,
-            height: 320,
-            decoration: BoxDecoration(
-              border: Border.all(color: color, width: 4),
-              borderRadius: const BorderRadius.all(Radius.elliptical(120, 160)),
+        // Face guide — oval sized to the screen (85% of the width, 4:3 tall).
+        Builder(builder: (context) {
+          final w = MediaQuery.sizeOf(context).width * 0.85;
+          final h = w * 4 / 3;
+          return Center(
+            child: Container(
+              width: w,
+              height: h,
+              decoration: BoxDecoration(
+                border: Border.all(color: color, width: 4),
+                borderRadius:
+                    BorderRadius.all(Radius.elliptical(w / 2, h / 2)),
+              ),
             ),
-          ),
-        ),
+          );
+        }),
         Positioned(
           left: 16,
           right: 16,
