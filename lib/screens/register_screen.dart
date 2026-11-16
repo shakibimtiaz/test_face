@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../services/database_service.dart';
 import '../services/face_recognition_service.dart';
+import '../utils/face_align.dart';
 import '../utils/image_utils.dart';
 
 class RegisterScreen extends StatefulWidget {
@@ -94,8 +95,22 @@ class _RegisterScreenState extends State<RegisterScreen> {
       if (crop.width < 60) {
         throw 'Face is too small. Use a closer photo.';
       }
+      final yaw = (face.headEulerAngleY ?? 0).abs();
+      if (yaw > 20) {
+        throw 'Face is turned sideways. Use a front-facing photo.';
+      }
 
-      final embedding = FaceRecognitionService.instance.getEmbedding(crop);
+      // Align the face (eyes, nose, mouth onto MobileFaceNet's template) —
+      // exactly the same pre-processing as on the Authenticate screen.
+      final service = FaceRecognitionService.instance;
+      final alignment = FaceAlignment.fromFace(face, service.inputSize);
+      if (alignment == null) {
+        throw 'Could not locate eyes/nose/mouth. Use a clearer, '
+            'front-facing photo (avoid strong glare on glasses).';
+      }
+      final aligned =
+          alignedFaceFromImage(upright, alignment, service.inputSize);
+      final embedding = service.getEmbedding(aligned);
       final thumb = img.copyResize(crop, width: 160, height: 160);
 
       setState(() {
@@ -118,7 +133,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
     if (_embedding == null || _faceJpeg == null) return;
 
     // Warn if this face already belongs to a different registered name.
-    final existing = await DatabaseService.instance.getAllFaces();
+    final existing = (await DatabaseService.instance.getAllFaces())
+        .where((f) =>
+            f.embeddingVersion == FaceRecognitionService.embeddingVersion)
+        .toList();
     final best = FaceRecognitionService.findBestMatch(_embedding!, existing);
     if (best != null &&
         best.similarity >= FaceRecognitionService.matchThreshold &&
@@ -153,6 +171,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
         embedding: _embedding!,
         faceJpeg: _faceJpeg!,
         createdAt: DateTime.now(),
+        embeddingVersion: FaceRecognitionService.embeddingVersion,
       ),
     );
     if (!mounted) return;

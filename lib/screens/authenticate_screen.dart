@@ -7,6 +7,7 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
 import '../services/database_service.dart';
 import '../services/face_recognition_service.dart';
+import '../utils/face_align.dart';
 import '../utils/image_utils.dart';
 
 /// Real-time authentication.
@@ -34,6 +35,10 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   static const _eyeClosed = 0.3;
   // Frames without a face before the current session is reset.
   static const _maxMissedFrames = 8;
+  // The SAME person must be confidently identified in this many consecutive
+  // frames before the match is accepted. One noisy frame (glare on glasses,
+  // motion blur) can no longer flip the result to a lookalike.
+  static const _requiredAgreeFrames = 3;
 
   CameraController? _controller;
   CameraDescription? _camera;
@@ -48,6 +53,7 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     options: FaceDetectorOptions(
       performanceMode: FaceDetectorMode.fast,
       enableClassification: true, // eye-open probabilities (blink)
+      enableLandmarks: true, // eyes/nose/mouth for face alignment
       enableTracking: true, // same trackingId across frames
       minFaceSize: 0.25,
     ),
@@ -63,7 +69,9 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   int? _trackingId;
   int _missedFrames = 0;
   FaceMatch? _match; // set once the face is recognised
-  double? _lastScore;
+  IdentifyResult? _lastResult; // for the on-screen best / runner-up scores
+  String? _candidateKey; // person currently winning the consecutive frames
+  int _agreeFrames = 0;
   bool _eyesWereOpen = false;
   bool _eyesClosed = false;
   bool _blinkDetected = false;
@@ -101,11 +109,19 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
   }
 
   Future<void> _init() async {
-    _registered = await DatabaseService.instance.getAllFaces();
+    final all = await DatabaseService.instance.getAllFaces();
+    // Only faces made with the current (aligned) pre-processing are comparable.
+    _registered = all
+        .where((f) =>
+            f.embeddingVersion == FaceRecognitionService.embeddingVersion)
+        .toList();
     if (_registered.isEmpty) {
       setState(() {
         _stage = _Stage.failed;
-        _error = 'No faces registered yet. Register a face first.';
+        _error = all.isEmpty
+            ? 'No faces registered yet. Register a face first.'
+            : 'Registered faces must be registered again after the '
+                'accuracy update (they are marked on the home screen).';
       });
       return;
     }
@@ -183,6 +199,9 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
       _trackingId = null;
       _missedFrames = 0;
       _match = null;
+      _lastResult = null;
+      _candidateKey = null;
+      _agreeFrames = 0;
       _eyesWereOpen = false;
       _eyesClosed = false;
       _blinkDetected = false;
@@ -246,9 +265,12 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
 
     setState(() {
       if (_match == null) {
-        _message = _lastScore == null
+        final r = _lastResult;
+        _message = r == null
             ? 'Look straight at the camera'
-            : 'Face not recognized';
+            : r.accepted
+                ? 'Hold still…'
+                : r.reason ?? 'Face not recognized';
       } else {
         _message = 'Blink your eyes';
       }
@@ -283,17 +305,33 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     final roll = (face.headEulerAngleZ ?? 0).abs();
     final l = face.leftEyeOpenProbability ?? 1;
     final r = face.rightEyeOpenProbability ?? 1;
-    if (yaw > 20 || roll > 20 || l < 0.4 || r < 0.4) return;
+    // Roll (head tilt) is corrected by the alignment, so allow more of it.
+    if (yaw > 20 || roll > 30 || l < 0.4 || r < 0.4) return;
 
     final service = FaceRecognitionService.instance;
-    final crop = cropFaceFromFrameFast(frame, face.boundingBox, service.inputSize);
-    final emb = service.getEmbedding(crop);
-    final best = FaceRecognitionService.findBestMatch(emb, _registered);
-    if (best == null) return;
-    _lastScore = best.similarity;
-    if (best.similarity >= FaceRecognitionService.matchThreshold) {
-      _match = best;
+    // Same 5-point alignment as registration (skip frame if landmarks missing).
+    final alignment = FaceAlignment.fromFace(face, service.inputSize);
+    if (alignment == null) return;
+    final aligned = alignedFaceFromFrame(frame, alignment, service.inputSize);
+    final emb = service.getEmbedding(aligned);
+
+    final result = FaceRecognitionService.identify(emb, _registered);
+    _lastResult = result;
+
+    if (!result.accepted) {
+      _candidateKey = null;
+      _agreeFrames = 0;
+      return;
     }
+    // Require the same person to win several consecutive frames.
+    final key = FaceRecognitionService.personKey(result.best!.face);
+    if (key == _candidateKey) {
+      _agreeFrames++;
+    } else {
+      _candidateKey = key;
+      _agreeFrames = 1;
+    }
+    if (_agreeFrames >= _requiredAgreeFrames) _match = result.best;
   }
 
   bool get _hasBothCameras =>
@@ -411,6 +449,22 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
     );
   }
 
+  /// Live scores — use these to tune matchThreshold / minMargin
+  /// (e.g. point the camera at Rafid and watch Sadman's "next" score).
+  String _scoreDebugText(IdentifyResult r) {
+    final best = r.best!;
+    final next = r.runnerUp;
+    final line1 = StringBuffer(
+        'best: ${best.face.name} ${best.similarity.toStringAsFixed(2)}');
+    if (next != null) {
+      line1.write('  •  next: ${next.face.name} '
+          '${next.similarity.toStringAsFixed(2)}');
+    }
+    return '$line1\n'
+        'threshold ${FaceRecognitionService.matchThreshold}  •  '
+        'min gap ${FaceRecognitionService.minMargin}';
+  }
+
   Widget _statusChip(String label, bool ok) => Chip(
         avatar: Icon(
           ok ? Icons.check_circle : Icons.hourglass_empty,
@@ -492,10 +546,10 @@ class _AuthenticateScreenState extends State<AuthenticateScreen>
                     _statusChip('Liveness (blink)', _blinkDetected),
                   ],
                 ),
-                if (_lastScore != null)
+                if (_lastResult?.best != null)
                   Text(
-                    'score ${_lastScore!.toStringAsFixed(2)} / '
-                    'threshold ${FaceRecognitionService.matchThreshold}',
+                    _scoreDebugText(_lastResult!),
+                    textAlign: TextAlign.center,
                     style: const TextStyle(color: Colors.white38, fontSize: 12),
                   ),
               ],

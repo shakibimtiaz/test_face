@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/database_service.dart';
+import '../services/face_recognition_service.dart';
 import 'attendance_screen.dart';
 import 'authenticate_screen.dart';
 import 'register_screen.dart';
@@ -102,12 +103,22 @@ class _HomeScreenState extends State<HomeScreen> {
                       itemCount: _faces.length,
                       itemBuilder: (_, i) {
                         final f = _faces[i];
+                        final outdated = f.embeddingVersion !=
+                            FaceRecognitionService.embeddingVersion;
                         return ListTile(
                           leading: CircleAvatar(
                               backgroundImage: MemoryImage(f.faceJpeg)),
                           title: Text(f.name),
-                          subtitle: Text(
-                              'Registered ${f.createdAt.toLocal().toString().substring(0, 16)}'),
+                          subtitle: outdated
+                              ? Text(
+                                  'Re-register needed (old format, '
+                                  'ignored when authenticating)',
+                                  style: TextStyle(
+                                      color:
+                                          Theme.of(context).colorScheme.error),
+                                )
+                              : Text(
+                                  'Registered ${f.createdAt.toLocal().toString().substring(0, 16)}'),
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
                             onPressed: () => _delete(f),

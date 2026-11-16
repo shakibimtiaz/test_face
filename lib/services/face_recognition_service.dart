@@ -12,17 +12,48 @@ class FaceMatch {
   FaceMatch(this.face, this.similarity);
 }
 
+/// Result of comparing one live face against everyone registered.
+class IdentifyResult {
+  /// Highest-scoring person (best of all their registered photos).
+  final FaceMatch? best;
+
+  /// Highest-scoring DIFFERENT person (not just another photo of [best]).
+  final FaceMatch? runnerUp;
+
+  /// True only if [best] passes the threshold AND clearly beats [runnerUp].
+  final bool accepted;
+
+  /// Why it was not accepted (for the on-screen hint), or null.
+  final String? reason;
+
+  const IdentifyResult(this.best, this.runnerUp, this.accepted, this.reason);
+
+  double get margin =>
+      best == null ? 0 : best!.similarity - (runnerUp?.similarity ?? -1);
+}
+
 /// Runs MobileFaceNet (assets/mobilefacenet.tflite) fully on-device to turn a
 /// cropped face into an embedding vector, and compares embeddings.
 class FaceRecognitionService {
   FaceRecognitionService._();
   static final FaceRecognitionService instance = FaceRecognitionService._();
 
-  /// Cosine-similarity threshold. Two L2-normalised MobileFaceNet embeddings
-  /// of the same person usually score above ~0.6; different people usually
-  /// score below ~0.45. Raise it to be stricter, lower it if genuine users
-  /// are being rejected (the live score is shown on the Authenticate screen).
-  static const double matchThreshold = 0.60;
+  /// Version of the face pre-processing used to create embeddings.
+  ///   1 = raw bounding-box crop (old, not comparable with 2)
+  ///   2 = 5-point landmark alignment (current)
+  /// Faces stored with an older version must be registered again.
+  static const int embeddingVersion = 2;
+
+  /// Cosine-similarity threshold for ALIGNED faces. Same person typically
+  /// scores ~0.70–0.90, different people ~0.10–0.50. Lookalikes can land in
+  /// between — that is what [minMargin] and the multi-frame agreement on the
+  /// Authenticate screen protect against. Tune with the live scores shown on
+  /// the Authenticate screen (best + runner-up).
+  static const double matchThreshold = 0.65;
+
+  /// The best person must beat the next DIFFERENT person by at least this
+  /// much; otherwise the result is "ambiguous" and nobody is authenticated.
+  static const double minMargin = 0.08;
 
   Interpreter? _interpreter;
   late List<int> _inputShape; // e.g. [1, 112, 112, 3]
@@ -125,5 +156,42 @@ class FaceRecognitionService {
       if (best == null || s > best.similarity) best = FaceMatch(r, s);
     }
     return best;
+  }
+
+  /// People are grouped by name, so several registered photos of the same
+  /// person never compete with each other in the margin check.
+  static String personKey(RegisteredFace f) => f.name.trim().toLowerCase();
+
+  /// Decides who this face is — or that it is nobody / ambiguous.
+  static IdentifyResult identify(
+    Float32List embedding,
+    List<RegisteredFace> registered,
+  ) {
+    // Best score per person (over all of that person's registered photos).
+    final perPerson = <String, FaceMatch>{};
+    for (final r in registered) {
+      final s = similarity(embedding, r.embedding);
+      final key = personKey(r);
+      final cur = perPerson[key];
+      if (cur == null || s > cur.similarity) perPerson[key] = FaceMatch(r, s);
+    }
+    if (perPerson.isEmpty) {
+      return const IdentifyResult(null, null, false, 'No faces registered');
+    }
+
+    final ranked = perPerson.values.toList()
+      ..sort((x, y) => y.similarity.compareTo(x.similarity));
+    final best = ranked.first;
+    final runnerUp = ranked.length > 1 ? ranked[1] : null;
+
+    if (best.similarity < matchThreshold) {
+      return IdentifyResult(best, runnerUp, false, 'Face not recognized');
+    }
+    if (runnerUp != null &&
+        best.similarity - runnerUp.similarity < minMargin) {
+      return IdentifyResult(best, runnerUp, false,
+          'Unsure: ${best.face.name} or ${runnerUp.face.name}?');
+    }
+    return IdentifyResult(best, runnerUp, true, null);
   }
 }

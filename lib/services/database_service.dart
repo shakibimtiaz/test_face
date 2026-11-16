@@ -12,12 +12,17 @@ class RegisteredFace {
   final Uint8List faceJpeg;
   final DateTime createdAt;
 
+  /// Pre-processing version the embedding was made with
+  /// (see FaceRecognitionService.embeddingVersion).
+  final int embeddingVersion;
+
   RegisteredFace({
     this.id,
     required this.name,
     required this.embedding,
     required this.faceJpeg,
     required this.createdAt,
+    required this.embeddingVersion,
   });
 
   Map<String, Object?> toMap() => {
@@ -30,6 +35,7 @@ class RegisteredFace {
         ),
         'face_image': faceJpeg,
         'created_at': createdAt.toIso8601String(),
+        'embedding_version': embeddingVersion,
       };
 
   factory RegisteredFace.fromMap(Map<String, Object?> m) {
@@ -42,6 +48,7 @@ class RegisteredFace {
       embedding: aligned.buffer.asFloat32List(),
       faceJpeg: m['face_image'] as Uint8List,
       createdAt: DateTime.parse(m['created_at'] as String),
+      embeddingVersion: (m['embedding_version'] as int?) ?? 1,
     );
   }
 }
@@ -74,7 +81,7 @@ class DatabaseService {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'face_attendance.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE users (
@@ -82,7 +89,8 @@ class DatabaseService {
             name TEXT NOT NULL,
             embedding BLOB NOT NULL,
             face_image BLOB NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            embedding_version INTEGER NOT NULL DEFAULT 1
           )
         ''');
         await db.execute('''
@@ -94,6 +102,13 @@ class DatabaseService {
             timestamp TEXT NOT NULL
           )
         ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // Existing faces were made without alignment → marked as version 1.
+          await db.execute('ALTER TABLE users '
+              'ADD COLUMN embedding_version INTEGER NOT NULL DEFAULT 1');
+        }
       },
     );
     return _db!;
